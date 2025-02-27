@@ -9,9 +9,9 @@ import (
 // Plugins are dynamically embedded command-line structures.
 //
 // Each element in the Plugins list *must* be a pointer to a structure.
-type Plugins []interface{}
+type Plugins []any
 
-func build(k *Kong, ast interface{}) (app *Application, err error) {
+func build(k *Kong, ast any) (app *Application, err error) {
 	v := reflect.ValueOf(ast)
 	iv := reflect.Indirect(v)
 	if v.Kind() != reflect.Ptr || iv.Kind() != reflect.Struct {
@@ -25,7 +25,7 @@ func build(k *Kong, ast interface{}) (app *Application, err error) {
 		seenFlags[flag.Name] = true
 	}
 
-	node, err := buildNode(k, iv, ApplicationNode, seenFlags)
+	node, err := buildNode(k, iv, ApplicationNode, newEmptyTag(), seenFlags)
 	if err != nil {
 		return nil, err
 	}
@@ -49,8 +49,11 @@ type flattenedField struct {
 	tag   *Tag
 }
 
-func flattenedFields(v reflect.Value) (out []flattenedField, err error) {
+func flattenedFields(v reflect.Value, ptag *Tag) (out []flattenedField, err error) {
 	v = reflect.Indirect(v)
+	if v.Kind() != reflect.Struct {
+		return out, nil
+	}
 	for i := 0; i < v.NumField(); i++ {
 		ft := v.Type().Field(i)
 		fv := v.Field(i)
@@ -61,6 +64,16 @@ func flattenedFields(v reflect.Value) (out []flattenedField, err error) {
 		if tag.Ignored {
 			continue
 		}
+		// Assign group if it's not already set.
+		if tag.Group == "" {
+			tag.Group = ptag.Group
+		}
+		// Accumulate prefixes.
+		tag.Prefix = ptag.Prefix + tag.Prefix
+		tag.EnvPrefix = ptag.EnvPrefix + tag.EnvPrefix
+		tag.XorPrefix = ptag.XorPrefix + tag.XorPrefix
+		// Combine parent vars.
+		tag.Vars = ptag.Vars.CloneWith(tag.Vars)
 		// Command and embedded structs can be pointers, so we hydrate them now.
 		if (tag.Cmd || tag.Embed) && ft.Type.Kind() == reflect.Ptr {
 			fv = reflect.New(ft.Type.Elem()).Elem()
@@ -68,7 +81,8 @@ func flattenedFields(v reflect.Value) (out []flattenedField, err error) {
 		}
 		if !ft.Anonymous && !tag.Embed {
 			if fv.CanSet() {
-				out = append(out, flattenedField{field: ft, value: fv, tag: tag})
+				field := flattenedField{field: ft, value: fv, tag: tag}
+				out = append(out, field)
 			}
 			continue
 		}
@@ -78,7 +92,7 @@ func flattenedFields(v reflect.Value) (out []flattenedField, err error) {
 			fv = fv.Elem()
 		} else if fv.Type() == reflect.TypeOf(Plugins{}) {
 			for i := 0; i < fv.Len(); i++ {
-				fields, ferr := flattenedFields(fv.Index(i).Elem())
+				fields, ferr := flattenedFields(fv.Index(i).Elem(), tag)
 				if ferr != nil {
 					return nil, ferr
 				}
@@ -86,20 +100,9 @@ func flattenedFields(v reflect.Value) (out []flattenedField, err error) {
 			}
 			continue
 		}
-		sub, err := flattenedFields(fv)
+		sub, err := flattenedFields(fv, tag)
 		if err != nil {
 			return nil, err
-		}
-		for _, subf := range sub {
-			// Assign parent if it's not already set.
-			if subf.tag.Group == "" {
-				subf.tag.Group = tag.Group
-			}
-			// Accumulate prefixes.
-			subf.tag.Prefix = tag.Prefix + subf.tag.Prefix
-			subf.tag.EnvPrefix = tag.EnvPrefix + subf.tag.EnvPrefix
-			// Combine parent vars.
-			subf.tag.Vars = tag.Vars.CloneWith(subf.tag.Vars)
 		}
 		out = append(out, sub...)
 	}
@@ -109,13 +112,13 @@ func flattenedFields(v reflect.Value) (out []flattenedField, err error) {
 // Build a Node in the Kong data model.
 //
 // "v" is the value to create the node from, "typ" is the output Node type.
-func buildNode(k *Kong, v reflect.Value, typ NodeType, seenFlags map[string]bool) (*Node, error) {
+func buildNode(k *Kong, v reflect.Value, typ NodeType, tag *Tag, seenFlags map[string]bool) (*Node, error) { //nolint:gocyclo
 	node := &Node{
 		Type:   typ,
 		Target: v,
-		Tag:    newEmptyTag(),
+		Tag:    tag,
 	}
-	fields, err := flattenedFields(v)
+	fields, err := flattenedFields(v, tag)
 	if err != nil {
 		return nil, err
 	}
@@ -134,13 +137,27 @@ MAIN:
 		tag := field.tag
 		name := tag.Name
 		if name == "" {
-			name = tag.Prefix + strings.ToLower(dashedString(ft.Name))
+			name = tag.Prefix + k.flagNamer(ft.Name)
 		} else {
 			name = tag.Prefix + name
 		}
 
-		if tag.Env != "" {
-			tag.Env = tag.EnvPrefix + tag.Env
+		if len(tag.Envs) != 0 {
+			for i := range tag.Envs {
+				tag.Envs[i] = tag.EnvPrefix + tag.Envs[i]
+			}
+		}
+
+		if len(tag.Xor) != 0 {
+			for i := range tag.Xor {
+				tag.Xor[i] = tag.XorPrefix + tag.Xor[i]
+			}
+		}
+
+		if len(tag.And) != 0 {
+			for i := range tag.And {
+				tag.And[i] = tag.XorPrefix + tag.And[i]
+			}
 		}
 
 		// Nested structs are either commands or args, unless they implement the Mapper interface.
@@ -168,6 +185,12 @@ MAIN:
 		delete(seenFlags, "--"+flag.Name)
 		if flag.Short != 0 {
 			delete(seenFlags, "-"+string(flag.Short))
+		}
+		if negFlag := negatableFlagName(flag.Name, flag.Tag.Negatable); negFlag != "" {
+			delete(seenFlags, negFlag)
+		}
+		for _, aflag := range flag.Aliases {
+			delete(seenFlags, "--"+aflag)
 		}
 	}
 
@@ -201,7 +224,7 @@ func validatePositionalArguments(node *Node) error {
 }
 
 func buildChild(k *Kong, node *Node, typ NodeType, v reflect.Value, ft reflect.StructField, fv reflect.Value, tag *Tag, name string, seenFlags map[string]bool) error {
-	child, err := buildNode(k, fv, typ, seenFlags)
+	child, err := buildNode(k, fv, typ, newEmptyTag(), seenFlags)
 	if err != nil {
 		return err
 	}
@@ -271,17 +294,18 @@ func buildField(k *Kong, node *Node, v reflect.Value, ft reflect.StructField, fv
 	}
 
 	value := &Value{
-		Name:         name,
-		Help:         tag.Help,
-		OrigHelp:     tag.Help,
-		HasDefault:   tag.HasDefault,
-		Default:      tag.Default,
-		DefaultValue: reflect.New(fv.Type()).Elem(),
-		Mapper:       mapper,
-		Tag:          tag,
-		Target:       fv,
-		Enum:         tag.Enum,
-		Passthrough:  tag.Passthrough,
+		Name:            name,
+		Help:            tag.Help,
+		OrigHelp:        tag.Help,
+		HasDefault:      tag.HasDefault,
+		Default:         tag.Default,
+		DefaultValue:    reflect.New(fv.Type()).Elem(),
+		Mapper:          mapper,
+		Tag:             tag,
+		Target:          fv,
+		Enum:            tag.Enum,
+		Passthrough:     tag.Passthrough,
+		PassthroughMode: tag.PassthroughMode,
 
 		// Flags are optional by default, and args are required by default.
 		Required: (!tag.Arg && tag.Required) || (tag.Arg && !tag.Optional),
@@ -295,19 +319,35 @@ func buildField(k *Kong, node *Node, v reflect.Value, ft reflect.StructField, fv
 			return failField(v, ft, "duplicate flag --%s", value.Name)
 		}
 		seenFlags["--"+value.Name] = true
+		for _, alias := range tag.Aliases {
+			aliasFlag := "--" + alias
+			if seenFlags[aliasFlag] {
+				return failField(v, ft, "duplicate flag %s", aliasFlag)
+			}
+			seenFlags[aliasFlag] = true
+		}
 		if tag.Short != 0 {
 			if seenFlags["-"+string(tag.Short)] {
 				return failField(v, ft, "duplicate short flag -%c", tag.Short)
 			}
 			seenFlags["-"+string(tag.Short)] = true
 		}
+		if tag.Negatable != "" {
+			negFlag := negatableFlagName(value.Name, tag.Negatable)
+			if seenFlags[negFlag] {
+				return failField(v, ft, "duplicate negation flag %s", negFlag)
+			}
+			seenFlags[negFlag] = true
+		}
 		flag := &Flag{
 			Value:       value,
+			Aliases:     tag.Aliases,
 			Short:       tag.Short,
 			PlaceHolder: tag.PlaceHolder,
-			Env:         tag.Env,
+			Envs:        tag.Envs,
 			Group:       buildGroupForKey(k, tag.Group),
 			Xor:         tag.Xor,
+			And:         tag.And,
 			Hidden:      tag.Hidden,
 		}
 		value.Flag = flag
