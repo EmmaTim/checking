@@ -20,7 +20,7 @@ type Option interface {
 // OptionFunc is function that adheres to the Option interface.
 type OptionFunc func(k *Kong) error
 
-func (o OptionFunc) Apply(k *Kong) error { return o(k) } // nolint: revive
+func (o OptionFunc) Apply(k *Kong) error { return o(k) } //nolint: revive
 
 // Vars sets the variables to use for interpolation into help strings and default values.
 //
@@ -55,12 +55,31 @@ func Exit(exit func(int)) Option {
 	})
 }
 
+type embedded struct {
+	strct any
+	tags  []string
+}
+
+// Embed a struct into the root of the CLI.
+//
+// "strct" must be a pointer to a structure.
+func Embed(strct any, tags ...string) Option {
+	t := reflect.TypeOf(strct)
+	if t.Kind() != reflect.Ptr || t.Elem().Kind() != reflect.Struct {
+		panic("kong: Embed() must be called with a pointer to a struct")
+	}
+	return OptionFunc(func(k *Kong) error {
+		k.embedded = append(k.embedded, embedded{strct, tags})
+		return nil
+	})
+}
+
 type dynamicCommand struct {
 	name  string
 	help  string
 	group string
 	tags  []string
-	cmd   interface{}
+	cmd   any
 }
 
 // DynamicCommand registers a dynamically constructed command with the root of the CLI.
@@ -68,8 +87,12 @@ type dynamicCommand struct {
 // This is useful for command-line structures that are extensible via user-provided plugins.
 //
 // "tags" is a list of extra tag strings to parse, in the form <key>:"<value>".
-func DynamicCommand(name, help, group string, cmd interface{}, tags ...string) Option {
+func DynamicCommand(name, help, group string, cmd any, tags ...string) Option {
 	return OptionFunc(func(k *Kong) error {
+		if run := getMethod(reflect.Indirect(reflect.ValueOf(cmd)), "Run"); !run.IsValid() {
+			return fmt.Errorf("kong: DynamicCommand %q must be a type with a 'Run' method; got %T", name, cmd)
+		}
+
 		k.dynamicCommands = append(k.dynamicCommands, &dynamicCommand{
 			name:  name,
 			help:  help,
@@ -133,7 +156,7 @@ func KindMapper(kind reflect.Kind, mapper Mapper) Option {
 }
 
 // ValueMapper registers a mapper to a field value.
-func ValueMapper(ptr interface{}, mapper Mapper) Option {
+func ValueMapper(ptr any, mapper Mapper) Option {
 	return OptionFunc(func(k *Kong) error {
 		k.registry.RegisterValue(ptr, mapper)
 		return nil
@@ -164,11 +187,11 @@ func Writers(stdout, stderr io.Writer) Option {
 //
 // There are two hook points:
 //
-// 		BeforeApply(...) error
-//   	AfterApply(...) error
+//			BeforeApply(...) error
+//	  	AfterApply(...) error
 //
 // Called before validation/assignment, and immediately after validation/assignment, respectively.
-func Bind(args ...interface{}) Option {
+func Bind(args ...any) Option {
 	return OptionFunc(func(k *Kong) error {
 		k.bindings.add(args...)
 		return nil
@@ -177,21 +200,43 @@ func Bind(args ...interface{}) Option {
 
 // BindTo allows binding of implementations to interfaces.
 //
-// 		BindTo(impl, (*iface)(nil))
-func BindTo(impl, iface interface{}) Option {
+//	BindTo(impl, (*iface)(nil))
+func BindTo(impl, iface any) Option {
 	return OptionFunc(func(k *Kong) error {
 		k.bindings.addTo(impl, iface)
 		return nil
 	})
 }
 
-// BindToProvider allows binding of provider functions.
+// BindToProvider binds an injected value to a provider function.
+//
+// The provider function must have one of the following signatures:
+//
+//	func(...) (T, error)
+//	func(...) T
+//
+// Where arguments to the function are injected by Kong.
 //
 // This is useful when the Run() function of different commands require different values that may
 // not all be initialisable from the main() function.
-func BindToProvider(provider interface{}) Option {
+func BindToProvider(provider any) Option {
 	return OptionFunc(func(k *Kong) error {
-		return k.bindings.addProvider(provider)
+		return k.bindings.addProvider(provider, false /* singleton */)
+	})
+}
+
+// BindSingletonProvider binds an injected value to a provider function.
+// The provider function must have the signature:
+//
+//	func(...) (T, error)
+//	func(...) T
+//
+// Unlike [BindToProvider], the provider function will only be called
+// at most once, and the result will be cached and reused
+// across multiple recipients of the injected value.
+func BindSingletonProvider(provider any) Option {
+	return OptionFunc(func(k *Kong) error {
+		return k.bindings.addProvider(provider, true /* singleton */)
 	})
 }
 
@@ -268,7 +313,7 @@ func AutoGroup(format func(parent Visitable, flag *Flag) *Group) Option {
 // See also ExplicitGroups for a more structured alternative.
 type Groups map[string]string
 
-func (g Groups) Apply(k *Kong) error { // nolint: revive
+func (g Groups) Apply(k *Kong) error { //nolint: revive
 	for key, info := range g {
 		lines := strings.Split(info, "\n")
 		title := strings.TrimSpace(lines[0])
@@ -428,24 +473,25 @@ func siftStrings(ss []string, filter func(s string) bool) []string {
 // Predefined environment variables are skipped.
 //
 // For example:
-//   --some.value -> PREFIX_SOME_VALUE
+//
+//	--some.value -> PREFIX_SOME_VALUE
 func DefaultEnvars(prefix string) Option {
 	processFlag := func(flag *Flag) {
-		switch env := flag.Env; {
+		switch env := flag.Envs; {
 		case flag.Name == "help":
 			return
-		case env == "-":
-			flag.Env = ""
+		case len(env) == 1 && env[0] == "-":
+			flag.Envs = nil
 			return
-		case env != "":
+		case len(env) > 0:
 			return
 		}
 		replacer := strings.NewReplacer("-", "_", ".", "_")
 		names := append([]string{prefix}, camelCase(replacer.Replace(flag.Name))...)
 		names = siftStrings(names, func(s string) bool { return !(s == "_" || strings.TrimSpace(s) == "") })
 		name := strings.ToUpper(strings.Join(names, "_"))
-		flag.Env = name
-		flag.Value.Tag.Env = name
+		flag.Envs = append(flag.Envs, name)
+		flag.Value.Tag.Envs = append(flag.Value.Tag.Envs, name)
 	}
 
 	var processNode func(node *Node)
@@ -460,6 +506,14 @@ func DefaultEnvars(prefix string) Option {
 
 	return PostBuild(func(k *Kong) error {
 		processNode(k.Model.Node)
+		return nil
+	})
+}
+
+// FlagNamer allows you to override the default kebab-case automated flag name generation.
+func FlagNamer(namer func(fieldName string) string) Option {
+	return OptionFunc(func(k *Kong) error {
+		k.flagNamer = namer
 		return nil
 	})
 }
