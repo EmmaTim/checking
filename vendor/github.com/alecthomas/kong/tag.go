@@ -9,48 +9,75 @@ import (
 	"unicode/utf8"
 )
 
+// PassthroughMode indicates how parameters are passed through when "passthrough" is set.
+type PassthroughMode int
+
+const (
+	// PassThroughModeNone indicates passthrough mode is disabled.
+	PassThroughModeNone PassthroughMode = iota
+	// PassThroughModeAll indicates that all parameters, including flags, are passed through. It is the default.
+	PassThroughModeAll
+	// PassThroughModePartial will validate flags until the first positional argument is encountered, then pass through all remaining positional arguments.
+	PassThroughModePartial
+)
+
 // Tag represents the parsed state of Kong tags in a struct field tag.
 type Tag struct {
-	Ignored     bool // Field is ignored by Kong. ie. kong:"-"
-	Cmd         bool
-	Arg         bool
-	Required    bool
-	Optional    bool
-	Name        string
-	Help        string
-	Type        string
-	TypeName    string
-	HasDefault  bool
-	Default     string
-	Format      string
-	PlaceHolder string
-	Env         string
-	Short       rune
-	Hidden      bool
-	Sep         rune
-	MapSep      rune
-	Enum        string
-	Group       string
-	Xor         []string
-	Vars        Vars
-	Prefix      string // Optional prefix on anonymous structs. All sub-flags will have this prefix.
-	EnvPrefix   string
-	Embed       bool
-	Aliases     []string
-	Negatable   bool
-	Passthrough bool
+	Ignored         bool // Field is ignored by Kong. ie. kong:"-"
+	Cmd             bool
+	Arg             bool
+	Required        bool
+	Optional        bool
+	Name            string
+	Help            string
+	Type            string
+	TypeName        string
+	HasDefault      bool
+	Default         string
+	Format          string
+	PlaceHolder     string
+	Envs            []string
+	Short           rune
+	Hidden          bool
+	Sep             rune
+	MapSep          rune
+	Enum            string
+	Group           string
+	Xor             []string
+	And             []string
+	Vars            Vars
+	Prefix          string // Optional prefix on anonymous structs. All sub-flags will have this prefix.
+	EnvPrefix       string
+	XorPrefix       string // Optional prefix on XOR/AND groups.
+	Embed           bool
+	Aliases         []string
+	Negatable       string
+	Passthrough     bool // Deprecated: use PassthroughMode instead.
+	PassthroughMode PassthroughMode
 
 	// Storage for all tag keys for arbitrary lookups.
 	items map[string][]string
 }
 
-type tagChars struct {
-	sep, quote, assign rune
+func (t *Tag) String() string {
+	out := []string{}
+	for key, list := range t.items {
+		for _, value := range list {
+			out = append(out, fmt.Sprintf("%s:%q", key, value))
+		}
+	}
+	return strings.Join(out, " ")
 }
 
-var kongChars = tagChars{sep: ',', quote: '\'', assign: '='}
-var bareChars = tagChars{sep: ' ', quote: '"', assign: ':'}
+type tagChars struct {
+	sep, quote, assign rune
+	needsUnquote       bool
+}
 
+var kongChars = tagChars{sep: ',', quote: '\'', assign: '=', needsUnquote: false}
+var bareChars = tagChars{sep: ' ', quote: '"', assign: ':', needsUnquote: true}
+
+//nolint:gocyclo
 func parseTagItems(tagString string, chr tagChars) (map[string][]string, error) {
 	d := map[string][]string{}
 	key := []rune{}
@@ -58,11 +85,25 @@ func parseTagItems(tagString string, chr tagChars) (map[string][]string, error) 
 	quotes := false
 	inKey := true
 
-	add := func() {
-		d[string(key)] = append(d[string(key)], string(value))
+	add := func() error {
+		// Bare tags are quoted, therefore we need to unquote them in the same fashion reflect.Lookup() (implicitly)
+		// unquotes "kong tags".
+		s := string(value)
+
+		if chr.needsUnquote && s != "" {
+			if unquoted, err := strconv.Unquote(fmt.Sprintf(`"%s"`, s)); err == nil {
+				s = unquoted
+			} else {
+				return fmt.Errorf("unquoting tag value `%s`: %w", s, err)
+			}
+		}
+
+		d[string(key)] = append(d[string(key)], s)
 		key = []rune{}
 		value = []rune{}
 		inKey = true
+
+		return nil
 	}
 
 	runes := []rune(tagString)
@@ -76,7 +117,10 @@ func parseTagItems(tagString string, chr tagChars) (map[string][]string, error) 
 			eof = true
 		}
 		if !quotes && r == chr.sep {
-			add()
+			if err := add(); err != nil {
+				return nil, err
+			}
+
 			continue
 		}
 		if r == chr.assign && inKey {
@@ -86,6 +130,12 @@ func parseTagItems(tagString string, chr tagChars) (map[string][]string, error) 
 		if r == '\\' {
 			if next == chr.quote {
 				idx++
+
+				// We need to keep the backslashes, otherwise subsequent unquoting cannot work
+				if chr.needsUnquote {
+					value = append(value, r)
+				}
+
 				r = chr.quote
 			}
 		} else if r == chr.quote {
@@ -109,7 +159,9 @@ func parseTagItems(tagString string, chr tagChars) (map[string][]string, error) 
 		return nil, fmt.Errorf("%v is not quoted properly", tagString)
 	}
 
-	add()
+	if err := add(); err != nil {
+		return nil, err
+	}
 
 	return d, nil
 }
@@ -166,7 +218,7 @@ func parseTag(parent reflect.Value, ft reflect.StructField) (*Tag, error) {
 	return t, nil
 }
 
-func hydrateTag(t *Tag, typ reflect.Type) error { // nolint: gocyclo
+func hydrateTag(t *Tag, typ reflect.Type) error { //nolint: gocyclo
 	var typeName string
 	var isBool bool
 	var isBoolPtr bool
@@ -197,7 +249,9 @@ func hydrateTag(t *Tag, typ reflect.Type) error { // nolint: gocyclo
 	t.Help = t.Get("help")
 	t.Type = t.Get("type")
 	t.TypeName = typeName
-	t.Env = t.Get("env")
+	for _, env := range t.GetAll("env") {
+		t.Envs = append(t.Envs, strings.FieldsFunc(env, tagSplitFn)...)
+	}
 	t.Short, err = t.GetRune("short")
 	if err != nil && t.Get("short") != "" {
 		return fmt.Errorf("invalid short flag name %q: %s", t.Get("short"), err)
@@ -210,14 +264,23 @@ func hydrateTag(t *Tag, typ reflect.Type) error { // nolint: gocyclo
 	for _, xor := range t.GetAll("xor") {
 		t.Xor = append(t.Xor, strings.FieldsFunc(xor, tagSplitFn)...)
 	}
+	for _, and := range t.GetAll("and") {
+		t.And = append(t.And, strings.FieldsFunc(and, tagSplitFn)...)
+	}
 	t.Prefix = t.Get("prefix")
 	t.EnvPrefix = t.Get("envprefix")
+	t.XorPrefix = t.Get("xorprefix")
 	t.Embed = t.Has("embed")
-	negatable := t.Has("negatable")
-	if negatable && !isBool && !isBoolPtr {
-		return fmt.Errorf("negatable can only be set on booleans")
+	if t.Has("negatable") {
+		if !isBool && !isBoolPtr {
+			return fmt.Errorf("negatable can only be set on booleans")
+		}
+		negatable := t.Get("negatable")
+		if negatable == "" {
+			negatable = negatableDefault // placeholder for default negation of --no-<flag>
+		}
+		t.Negatable = negatable
 	}
-	t.Negatable = negatable
 	aliases := t.Get("aliases")
 	if len(aliases) > 0 {
 		t.Aliases = append(t.Aliases, strings.FieldsFunc(aliases, tagSplitFn)...)
@@ -232,7 +295,7 @@ func hydrateTag(t *Tag, typ reflect.Type) error { // nolint: gocyclo
 	}
 	t.PlaceHolder = t.Get("placeholder")
 	t.Enum = t.Get("enum")
-	scalarType := (typ == nil || !(typ.Kind() == reflect.Slice || typ.Kind() == reflect.Map || typ.Kind() == reflect.Ptr))
+	scalarType := typ == nil || !(typ.Kind() == reflect.Slice || typ.Kind() == reflect.Map || typ.Kind() == reflect.Ptr)
 	if t.Enum != "" && !(t.Required || t.HasDefault) && scalarType {
 		return fmt.Errorf("enum value is only valid if it is either required or has a valid default value")
 	}
@@ -241,6 +304,17 @@ func hydrateTag(t *Tag, typ reflect.Type) error { // nolint: gocyclo
 		return fmt.Errorf("passthrough only makes sense for positional arguments or commands")
 	}
 	t.Passthrough = passthrough
+	if t.Passthrough {
+		passthroughMode := t.Get("passthrough")
+		switch passthroughMode {
+		case "partial":
+			t.PassthroughMode = PassThroughModePartial
+		case "all", "":
+			t.PassthroughMode = PassThroughModeAll
+		default:
+			return fmt.Errorf("invalid passthrough mode %q, must be one of 'partial' or 'all'", passthroughMode)
+		}
+	}
 	return nil
 }
 
